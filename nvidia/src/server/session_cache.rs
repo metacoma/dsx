@@ -690,3 +690,75 @@ impl SessionCache {
             <= self.arena.budget_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache(max_sessions: usize, budget_bytes: usize) -> SessionCache {
+        SessionCache::new(
+            CacheContextFingerprint { model: 1, vision: None, numerics: 1 },
+            max_sessions,
+            HostCacheArena::heap(budget_bytes, 1 << 20),
+            0,
+            8,
+            16,
+        )
+    }
+
+    #[test]
+    fn create_and_drop_session_clears_active_without_counting_an_eviction() {
+        let mut c = cache(4, 64 << 20);
+        c.begin_request();
+        let id = c.create_session(vec![1, 2, 3], 3);
+        assert_eq!(c.active, Some(id));
+        assert_eq!(c.session(id).map(|s| s.cached.len()), Some(3));
+        assert_eq!(c.stats.session_creates, 1);
+        c.drop_session(id);
+        assert!(c.sessions.is_empty());
+        assert_eq!(c.active, None);
+        assert_eq!(c.stats.session_evictions, 0, "dropping is not an LRU eviction");
+    }
+
+    #[test]
+    fn hit_and_touch_follow_the_request_clock() {
+        let mut c = cache(4, 64 << 20);
+        c.begin_request();
+        let id = c.create_session(vec![7], 1);
+        assert_eq!(c.session(id).unwrap().last_used, 1);
+        c.begin_request();
+        c.hit(id);
+        let s = c.session(id).unwrap();
+        assert_eq!(s.hits, 1);
+        assert_eq!(s.last_used, 2);
+        c.begin_request();
+        c.touch(id);
+        assert_eq!(c.session(id).unwrap().last_used, 3);
+    }
+
+    #[test]
+    fn combined_accounting_counts_cached_keys_and_live_logits() {
+        let mut c = cache(4, 1 << 20);
+        c.begin_request();
+        let id = c.create_session(vec![1, 2, 3, 4], 4);
+        let key_bytes = 4 * std::mem::size_of::<u32>();
+        assert_eq!(c.combined_used_bytes(), key_bytes);
+        c.session_mut(id).unwrap().live_logits = Some(vec![0.0; 8]);
+        assert_eq!(c.combined_used_bytes(), key_bytes + 8 * std::mem::size_of::<f32>());
+        assert!(c.fits_combined(0));
+        assert!(!c.fits_combined(1 << 20));
+        assert!(c.fits_combined((1 << 20) - c.combined_used_bytes()));
+    }
+
+    #[test]
+    fn session_count_is_clamped_to_one() {
+        assert_eq!(cache(0, 1 << 20).max_sessions, 1);
+        assert_eq!(cache(3, 1 << 20).max_sessions, 3);
+    }
+
+    #[test]
+    fn empty_arena_reports_no_payload_and_no_committed_bytes() {
+        let c = cache(2, 8 << 20);
+        assert_eq!(c.accounting(), (0, 0, 0, 8 << 20));
+    }
+}
