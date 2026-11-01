@@ -129,8 +129,10 @@ struct Slab {
     storage: Box<dyn SlabStorage>,
     /// allocations inside the slab, sorted by offset
     allocs: Vec<(usize, usize)>,
-    /// live extents (the slab is dropped when this reaches zero)
+    /// live extents (a reusable slab is dropped when this reaches zero)
     live: usize,
+    /// committed up front by `preallocate`: its RAM stays resident even while it holds no extent
+    held: bool,
 }
 
 impl Slab {
@@ -327,6 +329,7 @@ impl HostCacheArena {
             storage,
             allocs: vec![(0, want)],
             live: 1,
+            held: false,
         }));
         self.payload_bytes += want;
         self.peak_payload_bytes = self.peak_payload_bytes.max(self.payload_bytes);
@@ -336,6 +339,35 @@ impl HostCacheArena {
             off: 0,
             len: want,
         })
+    }
+
+    /// Commit slabs up front so the pinned allocation and its page faults happen at startup rather than inside the
+    /// first request. Commits whole slabs up to `bytes` (clamped to the budget) and keeps them resident even while
+    /// they hold no extent; later `allocate` calls reuse the free space. Returns the committed bytes.
+    pub fn preallocate(&mut self, bytes: usize) -> Result<usize, ArenaError> {
+        let target = align_up(bytes.min(self.budget_bytes).max(EXTENT_ALIGN), SLAB_ALIGN).min(self.budget_bytes);
+        while self.committed_bytes() < target {
+            let left = target - self.committed_bytes();
+            let size = self.slab_bytes.min(left).max(EXTENT_ALIGN);
+            if self.committed_bytes() + size > self.budget_bytes {
+                // the storage rounds the slab up past the budget (tiny budgets): keep what fits and let allocation
+                // reject only the requests that really need more
+                break;
+            }
+            let storage = (self.make)(size).map_err(|e| ArenaError::HostAllocation(format!("{e:#}")))?;
+            let size = storage.bytes();
+            if self.committed_bytes() + size > self.budget_bytes {
+                break;
+            }
+            self.slabs.push(Some(Slab {
+                storage,
+                allocs: vec![],
+                live: 0,
+                held: true,
+            }));
+            self.peak_committed_bytes = self.peak_committed_bytes.max(self.committed_bytes());
+        }
+        Ok(self.committed_bytes())
     }
 
     /// Return an extent. The slab is dropped (its RAM returned) as soon as its last extent is released, so
@@ -358,7 +390,7 @@ impl HostCacheArena {
         s.allocs.remove(pos);
         s.live = s.live.saturating_sub(1);
         self.payload_bytes = self.payload_bytes.saturating_sub(e.len);
-        if s.live == 0 {
+        if s.live == 0 && !s.held {
             *slot = None;
         }
     }
@@ -367,7 +399,7 @@ impl HostCacheArena {
     pub fn release_empty_slabs(&mut self) -> usize {
         let mut freed = 0;
         for slot in self.slabs.iter_mut() {
-            if slot.as_ref().is_some_and(|s| s.live == 0) {
+            if slot.as_ref().is_some_and(|s| s.live == 0 && !s.held) {
                 freed += slot.as_ref().map_or(0, |s| s.bytes());
                 *slot = None;
             }
@@ -488,6 +520,25 @@ mod tests {
         a.free(e3);
         assert_eq!(a.plan(32 << 20).unwrap(), AllocPlan::Reuse);
         a.free(e1);
+    }
+
+    #[test]
+    fn preallocate_commits_up_front_and_stays_resident() {
+        let mut a = HostCacheArena::heap(1 << 30, 64 << 20);
+        assert_eq!(a.preallocate(256 << 20).unwrap(), 256 << 20);
+        assert_eq!(a.slab_count(), 4);
+        assert_eq!(a.payload_bytes(), 0, "preallocation hands out no extent");
+        // the reserved slabs serve later allocations without another commit
+        let e = a.allocate(1 << 20).unwrap();
+        assert_eq!(a.committed_bytes(), 256 << 20);
+        a.free(e);
+        // a fully free preallocated slab stays resident (startup allocation is not undone by eviction)
+        a.release_empty_slabs();
+        assert_eq!(a.committed_bytes(), 256 << 20);
+        assert_eq!(a.slab_count(), 4);
+        // clamp to the budget instead of overcommitting
+        assert_eq!(a.preallocate(4 << 30).unwrap(), 1 << 30);
+        assert!(a.committed_bytes() <= a.budget_bytes());
     }
 
     #[test]

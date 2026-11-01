@@ -121,10 +121,22 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
             cache_context = fingerprint.describe(),
             "multi-session prefix cache"
         );
+        // Commit the pinned slabs now: the page faults and any memory pressure land at startup instead of inside the
+        // first request that parks a lineage.
+        let mut arena = HostCacheArena::pinned(budget, SESSION_CACHE_SLAB_BYTES);
+        let committed = arena.preallocate(budget)?;
+        tracing::info!(
+            event = "session_cache",
+            action = "arena-preallocated",
+            arena_committed_bytes = committed,
+            arena_budget_bytes = budget,
+            slabs = arena.slab_count(),
+            "multi-session cache arena committed"
+        );
         Some(SessionCache::new(
             fingerprint,
             args.cache_sessions,
-            HostCacheArena::pinned(budget, SESSION_CACHE_SLAB_BYTES),
+            arena,
             anchors,
             MAX_PROMPT_CHECKPOINTS,
             MAX_PREFIX_ANCHORS,
