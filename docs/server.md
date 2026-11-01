@@ -41,8 +41,8 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 | `--prefix-anchor-tokens N` | sparse prefix-anchor interval in prompt tokens for multi-session mode (default 16384; `0` disables anchors). A second agent sharing a long system/tools prefix replays only the divergent tail from an earlier anchor |
 | `DSX_GPUS=0,2` | use only these GPUs (all by default) |
 
-Multi-session cache architecture and state audit: [session-cache.md](session-cache.md). Runtime validation was
-performed locally; benchmark numbers are not part of this change.
+Multi-session cache usage, flags and limitations: [session-cache.md](session-cache.md). Only a local smoke test has
+been run; benchmark numbers are not part of this change.
 
 **Speed**
 

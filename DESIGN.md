@@ -82,8 +82,8 @@ arena and repacked on a side stream.
   Prompt checkpoints (rewind + boundary logits) stay per lineage, and sparse periodic prefix anchors (rewind state,
   no logits, `--prefix-anchor-tokens`, default 16384) let a second agent rewind into a shared system/tools prefix and
   prefill only its divergent tail. Whole inactive sessions are evicted by LRU on the session-count or byte budget.
-  The default `--cache-sessions 1` keeps the previous fast path with no host parking. Architecture and state audit:
-  [docs/session-cache.md](docs/session-cache.md).
+  The default `--cache-sessions 1` keeps the previous fast path with no host parking. Usage, flags and
+  limitations: [docs/session-cache.md](docs/session-cache.md).
 - llama.cpp's web UI is embedded and served at `/`, with the llama.cpp endpoints it expects (`/props`, `/slots`) and
   a `timings` chunk at the end of streamed responses.
 - Optional `--api-key`: one shared key, checked before every route that runs the model, in `Authorization: Bearer`
