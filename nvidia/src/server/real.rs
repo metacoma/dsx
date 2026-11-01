@@ -323,13 +323,6 @@ impl Real {
         // Take the manager out so the GPU model and the cache can be borrowed independently.
         let mut cache = self.multi.take().expect("multi cache");
         let r = multi_request(&mut self.gm, self.vision.as_ref(), &mut cache, prompt, p, emit);
-        if r.is_err() {
-            // the device state and the active lineage's `cached` tokens may disagree after a failed prefill or rewind:
-            // forget that lineage so the next request restores a parked session or prefills cold
-            if let Some(id) = cache.active {
-                cache.drop_session(id);
-            }
-        }
         self.multi = Some(cache);
         let (fin, stats) = r?;
         self.stats = stats;
@@ -514,7 +507,42 @@ fn prefill_with_anchors(
 }
 
 /// Execute one request against the multi-lineage cache.
+///
+/// Fail-closed wrapper around the request body. A failed park/restore/rewind/prefill leaves the device in an unknown
+/// mid-request state: the target lineage is already marked active, its parked copy is gone, and `cached` no longer
+/// matches the device. Drop that lineage (host extents included) and clear the physical sequence, so the next request
+/// cold-prefills instead of restoring a mismatched state. Only the hit rate pays for this; requests keep succeeding.
 fn multi_request(
+    gm: &mut GpuModel<'static>,
+    vision: Option<&VisionWeights>,
+    cache: &mut SessionCache,
+    prompt: &[u32],
+    p: &GenParams,
+    emit: &mut dyn FnMut(u32) -> bool,
+) -> Result<(Finish, GenStats)> {
+    let r = multi_request_inner(gm, vision, cache, prompt, p, emit);
+    if let Err(e) = r.as_ref() {
+        let dropped = cache.active.take();
+        if let Some(active) = dropped {
+            cache.drop_session(active);
+        }
+        gm.reset();
+        gm.images.clear();
+        tracing::warn!(
+            event = "session_cache",
+            action = "request-failed",
+            session_id = dropped.unwrap_or(0),
+            error = %e,
+            arena_payload_bytes = cache.arena.payload_bytes(),
+            arena_committed_bytes = cache.arena.committed_bytes(),
+            sessions_retained = cache.sessions.len(),
+            "session cache request failed; active lineage dropped, next request cold-prefills"
+        );
+    }
+    r
+}
+
+fn multi_request_inner(
     gm: &mut GpuModel<'static>,
     vision: Option<&VisionWeights>,
     cache: &mut SessionCache,
@@ -838,10 +866,17 @@ fn multi_request(
             cache.reject_admission_reason(Some(sid), "cache-budget", checkpoint_heap);
         } else if !duplicate_boundary {
             match gm.capture_rewind(&mut cache.arena) {
-                Ok(state) => {
-                    let idx = cache.session_index(sid).ok_or_else(|| anyhow::anyhow!("session cache: session for checkpoint"))?;
-                    cache.push_checkpoint(idx, PromptCheckpoint { pos: prompt.len(), logits: logits.clone(), state });
-                }
+                Ok(state) => match cache.session_index(sid) {
+                    Some(idx) => {
+                        cache.push_checkpoint(idx, PromptCheckpoint { pos: prompt.len(), logits: logits.clone(), state });
+                    }
+                    None => {
+                        // the lineage disappeared mid-request: the checkpoint is useless, release its extents instead of
+                        // leaking them through the error path
+                        state.free(&mut cache.arena);
+                        tracing::warn!(session_id = sid, "prompt checkpoint dropped: session vanished");
+                    }
+                },
                 Err(e) => {
                     // a full host cache only costs the checkpoint, not correctness
                     cache.reject_admission_reason(Some(sid), "host-allocation-failed", gm.rewind_state_bytes());
