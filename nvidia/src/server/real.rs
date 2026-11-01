@@ -58,14 +58,15 @@ pub struct RealEngineArgs {
 }
 
 /// Prompt-boundary snapshots kept for rewinding in the single-lineage fast path. A snapshot copies every layer's
-/// window ring and compressor state: about 5.6 MB on the shipped 40-layer model, so eight costs ~45 MB of GPU0 memory.
+/// window ring and compressor carry, both sized from the runtime config (the carry follows each layer's compress
+/// ratio): about 5.6 MB on the shipped 40-layer model, so eight costs ~45 MB of GPU0 memory.
 const PREFIX_CHECKPOINTS: usize = 8;
 
 /// Multi-session mode keeps the same number of prompt checkpoints per lineage, but they live in the host arena.
 const MAX_PROMPT_CHECKPOINTS: usize = 8;
 
-/// Bounded prefix anchors per lineage. At 16K tokens and ~5.6 MB per anchor this caps one lineage near 90 MB; the
-/// whole arena still obeys `--session-cache-gb`.
+/// Bounded prefix anchors per lineage. At 16K tokens and ~5.6 MB per anchor (the same runtime-sized rewind layout)
+/// this caps one lineage near 90 MB; the whole arena still obeys `--session-cache-gb`.
 const MAX_PREFIX_ANCHORS: usize = 16;
 
 /// Host slabs are committed lazily in this size, so a small cache never allocates the whole budget at startup.

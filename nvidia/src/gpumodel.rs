@@ -2415,9 +2415,11 @@ impl GpuModel<'_> {
     pub fn verify_spec(&mut self, pb: &PrefillBufs, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
         let c = &self.m.cfg;
         if self.vsnap.is_none() {
-            let (rb, sb) = (self.ring_bytes(), self.state_bytes());
+            let rb = self.ring_bytes();
             let n = self.layers.len();
-            self.vsnap = Some(Snapshot { pos: 0, rings: self.g.alloc(rb * n)?, states: self.g.alloc(sb * n)?, counters: vec![], engram_len: 0 });
+            // `snapshot_into` writes at the per-layer offsets of `state_offsets()`, so the buffer is one
+            // `state_bytes()` span: sizing it per layer multiplied it by the layer count.
+            self.vsnap = Some(Snapshot { pos: 0, rings: self.g.alloc(rb * n)?, states: self.g.alloc(self.state_bytes())?, counters: vec![], engram_len: 0 });
             self.vrows = Some(self.g.alloc(n * 2 * crate::handoff::MAXT * c.head_dim * 4)?);
         }
         let mut snap = self.vsnap.take().unwrap();
